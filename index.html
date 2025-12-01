@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>XAUUSD NUCLEAR SMC vC (Refined SMC + Liquidity)</title>
+  <style>
+    :root { --bg:#0b0c0f; --card:#111216; --accent:#06f; --good:#064; --bad:#600; --muted:#9aa; color-scheme: dark; }
+    body{ background:var(--bg); color:#fff; font-family:Inter, system-ui, Arial; padding:20px; margin:0; }
+    .wrap{ max-width:900px; margin:0 auto; }
+    h1{ margin:0 0 8px 0; font-size:20px; }
+    p.small{ color:var(--muted); margin:6px 0 16px 0; }
+    label{ font-size:13px; color:var(--muted); display:block; margin-top:8px; }
+    input{ width:100%; padding:10px; border-radius:8px; border:1px solid #222; background:var(--card); color:#fff; margin-top:6px; }
+    button{ padding:10px 14px; border-radius:8px; border:none; background:var(--accent); color:#fff; cursor:pointer; margin:8px 6px 8px 0; }
+    button.stop{ background:#c33; }
+    .status{ padding:10px; background:#0d0f12; border-radius:8px; margin-top:12px; }
+    .signalBox{ padding:12px; margin-top:12px; border-radius:8px; display:none; }
+    .logs{ background:#000; color:#0f0; padding:10px; height:280px; overflow:auto; border-radius:6px; margin-top:12px; font-family:monospace; white-space:pre-line; }
+    .infoRow{ display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }
+    .chip{ background:#0d0f12; padding:6px 10px; border-radius:8px; color:var(--muted); font-size:13px; }
+    small{ color:var(--muted); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>XAUUSD NUCLEAR SMC vC</h1>
+    <p class="small">Refined SMC (MSS) + Liquidity Grab detection. 8 indicators → signal when 4+ confirm → Telegram.</p>
+
+    <label>TwelveData API Key (fill after hosting)</label>
+    <input id="td_key" placeholder="ENTER HERE AFTER UPLOAD (do NOT commit to repo)">
+
+    <label>Telegram Bot Token</label>
+    <input id="tg_token" placeholder="123456:ABC...">
+
+    <label>Chat IDs (comma separated) — include channel id if posting to channel (e.g. -100123...)</label>
+    <input id="tg_chats" placeholder="12345678,-1001234567890">
+
+    <div class="infoRow">
+      <button id="startBtn">Start Bot</button>
+      <button id="stopBtn" class="stop">Stop Bot</button>
+      <div class="chip" id="runStatus">Status: Stopped</div>
+      <div class="chip" id="lastSignal">Last Signal: —</div>
+    </div>
+
+    <div id="signal" class="signalBox"></div>
+
+    <div class="status" id="summary">Config: XAU/USD • 15m/1h/4h analysis • 1-min scheduler (browser)</div>
+
+    <div class="logs" id="logs"></div>
+  </div>
+
+<script>
+/*
+  XAUUSD Nuclear SMC vC
+  - 8 indicators (OB15, OB1H, FVG, VolSpike, 4H Bias, ATR shift, MSS, Liquidity Grab)
+  - Signal when >=4 confirm (CHANGED FROM 5 → 4)
+*/
+
+// ============== CONFIG ==============
+const SYMBOL = "XAU/USD";
+const INTERVAL_MS = 60 * 1000;            // scan every 60s (browser)
+const COOLDOWN_MS = 60 * 60 * 1000;       // 1 hour between signals
+const MIN_CONFIRM = 4;                    // ←←← YEH CHANGE KIYA GAYA HAI (5 → 4)
+const LOOKBACK_M15 = 200;
+const LOOKBACK_1H  = 200;
+const LOOKBACK_4H  = 120;
+const VOLUME_MULT = 2.2;
+const WICK_ATR_MULT = 1.1;
+const ATR_INCREASE_MULT = 1.15;
+const MSS_LOOKBACK = 30;
+const RR = 4;
+// =====================================
+
+let loopId = null;
+let running = false;
+let lastSignalTime = 0;
+
+const logsEl = document.getElementById('logs');
+const statusEl = document.getElementById('runStatus');
+const lastSignalEl = document.getElementById('lastSignal');
+const signalBox = document.getElementById('signal');
+
+function log(msg){
+  const t = new Date().toLocaleString();
+  logsEl.innerText += `[\( {t}] \){msg}\n`;
+  logsEl.scrollTop = logsEl.scrollHeight;
+}
+function setStatus(txt){ statusEl.innerText = 'Status: ' + txt; }
+function setLastSignal(txt){ lastSignalEl.innerText = 'Last Signal: ' + txt; }
+
+function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
+function safeNum(v){ return typeof v === 'number' && !isNaN(v) ? v : 0; }
+function fmt(n, d=2){ return Number(n).toFixed(d); }
+
+// ============== Twelve Data fetch ==============
+async function fetchTD(intervalKey, limit){
+  const key = document.getElementById('td_key').value.trim();
+  if(!key){ log('TwelveData key missing'); return []; }
+  const map = {'15m':'15min','1h':'1h','4h':'4h'};
+  const intv = map[intervalKey] || intervalKey;
+  const url = `https://api.twelvedata.com/time_series?symbol=\( {encodeURIComponent(SYMBOL)}&interval= \){intv}&apikey=\( {encodeURIComponent(key)}&outputsize= \){limit}&format=JSON&timezone=UTC`;
+  try{
+    const r = await fetch(url);
+    const j = await r.json();
+    if(!j || !j.values){ log('TD error: ' + (j && j.message ? j.message : JSON.stringify(j))); return []; }
+    return j.values.reverse().map(v=>({
+      t: new Date(v.datetime).getTime(),
+      o: safeNum(parseFloat(v.open)),
+      h: safeNum(parseFloat(v.high)),
+      l: safeNum(parseFloat(v.low)),
+      c: safeNum(parseFloat(v.close)),
+      v: safeNum(parseFloat(v.volume || 0))
+    }));
+  }catch(e){
+    log('FetchTD err: '+ e.message);
+    return [];
+  }
+}
+
+// ============== Indicators ==============
+function ATR(candles, period=14){
+  if(!candles || candles.length < period+1) return 0;
+  const trs = [];
+  for(let i=1;i<candles.length;i++){
+    const cur=candles[i], prev=candles[i-1];
+    trs.push(Math.max(cur.h - cur.l, Math.abs(cur.h - prev.c), Math.abs(cur.l - prev.c)));
+  }
+  let atr = trs.slice(0,period).reduce((a,b)=>a+b,0) / period;
+  for(let i=period;i<trs.length;i++){
+    atr = (atr*(period-1) + trs[i]) / period;
+  }
+  return atr;
+}
+
+function SMA_of_ATR_series(candles, atrPeriod=14, smaPeriod=20){
+  if(candles.length < atrPeriod + smaPeriod) return 0;
+  const atrs = [];
+  for(let start=0; start <= candles.length - atrPeriod - 1; start++){
+    const slice = candles.slice(start, start + atrPeriod + 1);
+    atrs.push(ATR(slice, atrPeriod));
+  }
+  const lastSMAPeriod = atrs.slice(-smaPeriod);
+  return lastSMAPeriod.reduce((a,b)=>a+b,0)/lastSMAPeriod.length;
+}
+
+function detectOB(candles){
+  let bull = null, bear = null;
+  for(let i=3;i<candles.length-2;i++){
+    const p = candles[i-1], x = candles[i];
+    if(p.c < p.o && x.c > x.o && x.c > p.h && x.l <= p.l) bull = { price: p.l, idx: i-1 };
+    if(p.c > p.o && x.c < x.o && x.c < p.l && x.h >= p.h) bear = { price: p.h, idx: i-1 };
+  }
+  return { bull, bear };
+}
+
+function detectFVG(candles){
+  for(let i=2;i<candles.length;i++){
+    const a=candles[i-2], x=candles[i];
+    if(a.h < x.l) return 'bull';
+    if(a.l > x.h) return 'bear';
+  }
+  return null;
+}
+
+function isVolumeSpike(candles, mult=VOLUME_MULT){
+  if(!candles || candles.length < 12) return false;
+  const last = candles[candles.length-1].v;
+  const avg = candles.slice(-11,-1).reduce((s,c)=>s+(c.v),0) / 10;
+  return last > avg * mult;
+}
+
+function trendBiasFrom4h(h4){
+  if(!h4 || h4.length < 20) return 'neutral';
+  const closes = h4.map(c=>c.c);
+  const sma20 = closes.slice(-21,-1).reduce((a,b)=>a+b,0) / 20;
+  const last = closes[closes.length-1];
+  return last > sma20 ? 'bull' : last < sma20 ? 'bear' : 'neutral';
+}
+
+function detectMSS(candles){
+  if(!candles || candles.length < MSS_LOOKBACK + 5) return null;
+  const start = Math.max(0, candles.length - MSS_LOOKBACK);
+  let swingHigh = -Infinity, swingLow = Infinity;
+  for(let i=start;i<candles.length;i++){
+    if(candles[i].h > swingHigh) swingHigh = candles[i].h;
+    if(candles[i].l < swingLow) swingLow = candles[i].l;
+  }
+  const last = candles[candles.length-1];
+  if(last.h > swingHigh && last.c < last.o) return 'mss_bull_break';
+  if(last.l < swingLow && last.c > last.o) return 'mss_bear_break';
+  return null;
+}
+
+function detectLiquidityGrab(candles){
+  if(!candles || candles.length < 20) return { top:false, bottom:false, atr:0, vol:false };
+  const atr = ATR(candles, 14);
+  let swingHigh = -Infinity, swingLow = Infinity;
+  const look = 20;
+  for(let i=candles.length - look; i < candles.length; i++){
+    if(candles[i].h > swingHigh) swingHigh = candles[i].h;
+    if(candles[i].l < swingLow) swingLow = candles[i].l;
+  }
+  const last = candles[candles.length-1];
+  const wickTop = last.h - Math.max(last.c, last.o);
+  const wickBottom = Math.min(last.c, last.o) - last.l;
+  const volOk = isVolumeSpike(candles, VOLUME_MULT);
+  const topSweep = (last.h > swingHigh) && (wickTop > atr * WICK_ATR_MULT) && (last.c < last.o) && volOk;
+  const bottomSweep = (last.l < swingLow) && (wickBottom > atr * WICK_ATR_MULT) && (last.c > last.o) && volOk;
+  return { top: topSweep, bottom: bottomSweep, atr, volOk };
+}
+
+function candlePower(candles){
+  const x = candles[candles.length-1];
+  if(!x) return 0;
+  return (x.c - x.o) / (x.h - x.l + 1e-8);
+}
+
+function atrVolatilityShift(candles){
+  const atrNow = ATR(candles,14);
+  const atrSMA = SMA_of_ATR_series(candles,14,20);
+  if(!atrSMA) return false;
+  return atrNow > atrSMA * ATR_INCREASE_MULT;
+}
+
+// ============== SCAN ==============
+async function scanOnce(){
+  try{
+    const [m15, h1, h4] = await Promise.all([
+      fetchTD('15m', LOOKBACK_M15),
+      fetchTD('1h', LOOKBACK_1H),
+      fetchTD('4h', LOOKBACK_4H)
+    ]);
+
+    if(!m15.length || m15.length < 40){
+      log('Not enough M15 data');
+      return;
+    }
+
+    const price = m15[m15.length-1].c;
+    const atr15 = ATR(m15, 14);
+    const ob15 = detectOB(m15.slice(-80));
+    const ob1h = detectOB(h1.slice(-80));
+    const fvg = detectFVG(m15.slice(-30));
+    const volSpike = isVolumeSpike(m15);
+    const bias4h = trendBiasFrom4h(h4);
+    const atrShift = atrVolatilityShift(m15);
+    const mss = detectMSS(m15);
+    const liq = detectLiquidityGrab(m15);
+
+    const ind1 = !!(ob15.bull || ob15.bear);
+    const ind2 = !!(ob1h.bull || ob1h.bear);
+    const ind3 = !!fvg;
+    const ind4 = volSpike;
+    const ind5 = bias4h !== 'neutral';
+    const ind6 = atrShift;
+    const ind7 = !!mss;
+    const ind8 = (liq.top || liq.bottom) && liq.volOk;
+
+    const indicators = [ind1, ind2, ind3, ind4, ind5, ind6, ind7, ind8];
+    const confirmed = indicators.filter(x=>x).length;
+
+    log(`Price \( {fmt(price)} | Confirmed \){confirmed}/8`);
+
+    if(Date.now() - lastSignalTime < COOLDOWN_MS){
+      if(confirmed >= MIN_CONFIRM) log('Signal blocked by cooldown');
+      return;
+    }
+
+    if(confirmed >= MIN_CONFIRM){
+      let direction = 'LONG';
+      if(liq.top) direction = 'SHORT';
+      else if(liq.bottom) direction = 'LONG';
+      else if(mss && mss.includes('bear')) direction = 'SHORT';
+      else if(mss && mss.includes('bull')) direction = 'LONG';
+      else direction = (bias4h === 'bull') ? 'LONG' : (bias4h === 'bear') ? 'SHORT' : 'LONG';
+
+      const entry = price;
+      const slBuffer = Math.max(atr15 * 1.2, 0.5);
+      let sl = (direction === 'LONG') ? entry - slBuffer : entry + slBuffer;
+      let tp = (direction === 'LONG') ? entry + (entry - sl) * RR : entry - (sl - entry) * RR;
+
+      const entryF = fmt(entry,2), slF = fmt(sl,2), tpF = fmt(tp,2);
+
+      const msgLines = [];
+      msgLines.push('<b>⚡ XAUUSD NUCLEAR SMC vC — SIGNAL</b>');
+      msgLines.push(direction === 'LONG' ? '🟢 <b>LONG</b>' : '🔴 <b>SHORT</b>');
+      msgLines.push('');
+      msgLines.push(`Entry: <b>${entryF}</b>`);
+      msgLines.push(`SL: <b>${slF}</b>`);
+      msgLines.push(`TP: <b>${tpF}</b>`);
+      msgLines.push(`RR: <b>1:${RR}</b>`);
+      msgLines.push('');
+      msgLines.push(`<b>Confirmed:</b> ${confirmed}/8`);
+      msgLines.push(`Time: ${new Date().toLocaleString()}`);
+
+      const tgMsg = msgLines.join('\n');
+
+      await sendToTelegram(tgMsg);
+
+      lastSignalTime = Date.now();
+      setLastSignal(new Date().toLocaleTimeString());
+      signalBox.style.display = 'block';
+      signalBox.style.background = (direction==='LONG') ? '#063' : '#600';
+      signalBox.innerHTML = tgMsg.replace(/\n/g,'<br>');
+      log('SIGNAL SENT -> ' + direction);
+    }
+
+  }catch(e){
+    log('Scan error: ' + e.message);
+  }
+}
+
+// ============== Telegram ==============
+async function sendToTelegram(msgHtml){
+  const token = document.getElementById('tg_token').value.trim();
+  if(!token){ log('TG token not set'); return; }
+  const chatStr = document.getElementById('tg_chats').value.trim();
+  if(!chatStr){ log('No chat IDs'); return; }
+  const chatIds = chatStr.split(',').map(s=>s.trim()).filter(s=>s.length);
+
+  for(const id of chatIds){
+    const url = `https://api.telegram.org/bot\( {encodeURIComponent(token)}/sendMessage?chat_id= \){encodeURIComponent(id)}&text=${encodeURIComponent(msgHtml)}&parse_mode=HTML&disable_web_page_preview=true`;
+    try{
+      const res = await fetch(url);
+      const j = await res.json();
+      if(j && j.ok) log('Sent to ' + id);
+      else log('TG err: ' + JSON.stringify(j));
+    }catch(e){
+      log('TG send failed: ' + e.message);
+    }
+    await sleep(250);
+  }
+}
+
+// ============== Control ==============
+document.getElementById('startBtn').addEventListener('click', ()=>{
+  if(running) return;
+  const key = document.getElementById('td_key').value.trim();
+  if(!key){
+    alert('TwelveData API key daalo pehle.');
+    return;
+  }
+  running = true;
+  setStatus('Running');
+  log('Bot started');
+  scanOnce();
+  loopId = setInterval(scanOnce, INTERVAL_MS);
+});
+
+document.getElementById('stopBtn').addEventListener('click', ()=>{
+  if(loopId) clearInterval(loopId);
+  running = false;
+  setStatus('Stopped');
+  log('Bot stopped');
+});
+
+if(location.hostname.includes('github.io')){
+  setTimeout(()=>{
+    const k=document.getElementById('td_key').value.trim();
+    const t=document.getElementById('tg_token').value.trim();
+    if(k && t){ document.getElementById('startBtn').click(); }
+  }, 3000);
+}
+
+</script>
+</body>
+</html>
